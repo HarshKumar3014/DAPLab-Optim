@@ -1,31 +1,147 @@
-# DAPLab-Optim
+# AdamW vs Muon: Diagnosing Optimization During Fine-Tuning
 
-# Diagnosing Optimization During Fine-Tuning: AdamW vs Muon
+A lightweight study of how AdamW and Muon differ when fine-tuning a small
+pretrained LM on SST-2. The training and evaluation loop is written by hand;
+only the model, tokenizer and dataset come from libraries.
 
-**Setup.** SmolLM2-135M fine-tuned on SST-2, 400 steps, batch 32, cosine schedule with 6% warmup, grad-clip 1.0, fp16 autocast with fp32 master weights on a single T4. Both arms use the *identical* parameter split — hidden matrices to the optimizer under test, embeddings/classifier-head/norms/biases to AdamW at a fixed LR — so the only thing that varies is which optimizer touches the matrices. Each arm gets its own 6-point LR sweep; we compare best-vs-best by dev accuracy (2k held out from train; the official validation split is touched once, as test). 3 seeds, mean ± std throughout.
+**Premise.** The two optimizers differ in *geometry*, not just tuning. AdamW
+normalizes coordinate-wise, so its update inherits the gradient's spectral
+concentration. Muon orthogonalizes the momentum matrix — steepest descent under
+the spectral norm, i.e. the linear minimization oracle `argmax_{‖Δ‖₂≤1} ⟨M,Δ⟩ =
+UVᵀ` — so every singular value of the step is ≈1. That is a falsifiable claim,
+so the primary probes here are geometric rather than accuracy-based; SST-2
+accuracy saturates and cannot separate these optimizers.
+
+Full write-up: [`REPORT.md`](REPORT.md).
+
+## Headline results
 
 | | AdamW (lr 1e-4) | Muon (lr 3e-4) |
 |---|---|---|
-| dev / test / OOD acc | .920±.001 / .918±.008 / .863±.017 | .922±.003 / .914±.006 / .866±.012 |
-| λ_max(H) | 327 ± 100 | 442 ± 225 |
-| tr(H) | 598 ± 324 | 613 ± 241 |
-| adaptive sharpness | .0152 ± .0037 | .0133 ± .0011 |
+| dev / test / OOD accuracy | .920 / .918 / .863 | .922 / .914 / .866 |
 | stable rank of ΔW (per layer) | 1.0 – 7.4 | 47 – 205 |
 | spectral entropy of ΔW | .61 – .93 | .91 – .99 |
-| mean cos(g_t, g_t−1) | .087 ± .014 | .053 ± .007 |
-| ‖W‖ (tracked layers) | 1042.6 | 1042.2 |
+| dev acc at 30× optimal LR (3e-3) | 0.546 (chance = 0.509) | 0.845 |
 | s/step (training only) | 0.567 | 1.237 |
 
-**Metrics, and why.** Accuracy alone cannot distinguish these optimizers on a saturating task, so the primary probes are geometric. AdamW normalizes coordinate-wise, giving an update ≈ sign(g) whose spectrum is concentrated; Muon orthogonalizes the momentum matrix, so every singular value of the *step* is ≈1. **Stable rank** ‖ΔW‖²_F/‖ΔW‖²₂ and **spectral entropy** of the cumulative ΔW test that prediction directly. **Per-layer relative update norm** tests whether Muon equalizes progress across depth. **cos(g_t, g_t−1)** measures gradient noise and is the mechanistic bridge to the momentum question. Sharpness is measured three ways — λ_max by power iteration on Hessian-vector products, tr(H) by Hutchinson, and adaptive worst-case sharpness max‖ε/|θ|‖≤ρ L(θ+ε)−L(θ) — because they probe different things (one stiff direction, average curvature, a reachable ε-ball) and can disagree.
+Three findings, in order of how well they are supported:
 
-**Which optimizer performed better?** By accuracy, neither: all three splits are inside one seed std, and AdamW is nominally ahead on test. The real separations are elsewhere. Muon is far more robust to learning rate: at 3e-3, 30× its optimum, AdamW collapses to 0.546 (chance is 0.509) while Muon still reaches 0.845; within 2% of peak, Muon's stable basin spans ~1e-4→1e-3 against AdamW's ~3e-5→1e-4. Muon is worse at low LR (0.785 vs 0.864 at 1e-5) — the advantage is one-sided. AdamW wins on cost: Muon's Newton–Schulz iteration makes it **2.18× slower per step** here, though this is inflated by the T4 lacking bf16 tensor cores (NS runs in fp32) and by SST-2's ~13-token sentences making the model's own forward pass unusually cheap.
+1. **Geometry separates cleanly.** Muon's cumulative weight change is 20–40×
+   higher stable rank than AdamW's, consistently across depth. At the deepest
+   tracked matrix AdamW's ΔW has stable rank 1.0 — its entire cumulative update
+   to that layer lies in essentially one direction.
+2. **Muon is markedly more LR-robust**, but only above the optimum; it is worse
+   than AdamW at low LR (.785 vs .864 at 1e-5). AdamW is 2.18× faster per step.
+3. **Accuracy is a null.** All three splits sit inside one seed standard
+   deviation. Sharpness is also a null, and the three estimators disagree on the
+   sign — see the report.
 
-**Which solution is flatter?** No reliable difference, and the estimators disagree on the sign. λ_max says Muon is sharper, adaptive sharpness says Muon is flatter, tr(H) says they are identical, and the filter-normalized 1D profiles overlap within error. The adaptive-sharpness gap is 0.0019 against a pooled SE of 0.0022 (t≈0.85). Notably, the reparameterization confound that usually explains such disagreements is *measurably absent*: Dinh et al. (2017) showed λ_max is not invariant to layer-wise rescaling, but the two arms end at ‖W‖ = 1042.6 vs 1042.2 (0.04% apart), so scale cannot account for it. The disagreement is better explained by λ_max probing a single top eigendirection while adaptive sharpness integrates over a reachable ball — plus λ_max's own 31–51% relative seed variance.
+## Running it
 
-**Momentum (the most interesting result).** Removing momentum *helps* AdamW (.925 vs .918, Δ=−.007, t≈3.4, n=4) and *hurts* Muon (.913 vs .918, Δ=+.005, t≈1.4). The Muon simple effect is not individually significant, but the interaction is (Δ-of-Δ = .012, t≈2.9). A mechanism is available: AdamW's second moment already performs per-coordinate variance adaptation, so β₁ adds little; Muon has no variance adaptation anywhere, making the momentum buffer its only noise control — and with cos(g_t,g_t−1)≈0.05, consecutive gradients are nearly orthogonal, so orthogonalizing a single noisy minibatch gradient promotes noise directions to unit scale. Because Newton–Schulz Frobenius-normalizes its input, it is scale-invariant, so for Muon this is a *pure direction* ablation with no effective-LR confound; AdamW's is not as clean.
+```bash
+# Colab (T4), one cell:
+%run adamw_vs_muon_sst2.py
+# or locally, CUDA required:
+pip install torch transformers datasets matplotlib
+python adamw_vs_muon_sst2.py
+```
 
-**Reliability.** Two of the four headline claims (geometry, LR robustness) are large and stable; the accuracy null is well-supported; the sharpness comparison is underpowered and should not be quoted as a result. Limitations: one dataset and task, SFT only — **this does not test the RLVR regime**, since SST-2 gives a dense signal, not a sparse verified reward; sharpness measured on one fixed 128-example batch; a randomly initialized head dominating early steps; a coarse LR grid whose optimum may sit between points; curvature probed only at the final step, so we see geometry evolving through training but not the landscape.
+Everything is in one file. ~3.5 h end to end on a free T4:
 
-**In a larger study:** a width/depth ladder with μP-style LR transfer, since Muon's claimed advantage is scale-dependent; GRPO on a verifiable-reward task to reach the sparse regime; per-domain evals (code vs math); Shampoo and SOAP to separate orthogonalization from second-order preconditioning; critical batch size per optimizer; ≥10 seeds for the sharpness and momentum effects; and full curvature probes at several checkpoints.
+| stage | runs | time |
+|---|---|---|
+| LR sweep | 12 × 200 steps | ~36 min |
+| main runs (3 seeds, full curvature probes) | 6 × 400 steps | ~75 min |
+| momentum ablation (4 seeds) | 16 × 400 steps | ~100 min |
 
-**Problems encountered.** The first full run returned empty sharpness columns: `create_graph=True` fails inside the Hessian probes because the flash/mem-efficient SDPA kernels have no double-backward implementation. Forcing the math backend during probes fixed it. The failure was caught by a broad `except` and logged rather than raised, so it cost a full 3.5-hour session — the lesson being that a probe which degrades silently is worse than one that crashes. A self-test that exercises double-backward through attention now runs in the first five seconds.
+Completed runs are cached as `results/<tag>.json` and skipped on re-execution, so
+an interrupted session costs one run rather than the session. A cached run whose
+curvature probe failed is recomputed rather than silently leaving a hole.
+
+Outputs land in `results/`: one JSON per run, four figures under
+`results/figures/`, and `results/summary.md` with all three tables.
+
+A self-test runs first (~5 s) and validates every estimator against a closed
+form before any of them are trusted on a real model: Newton–Schulz collapsing a
+badly conditioned spectrum, `λ_max` against the exact top eigenvalue of a known
+quadratic, the Hutchinson trace against the exact trace, and a double-backward
+through attention. If it fails, nothing downstream is meaningful.
+
+## Experimental design
+
+**Data.** SST-2 test labels are hidden, so 2 000 examples are held out from
+`train` as the dev set used for *all* model selection; the official `validation`
+split (872) is touched exactly once, as test. OOD evaluation uses
+`rotten_tomatoes` (same task, longer reviews).
+
+**Fairness contract.** Both arms use the *identical* parameter split — hidden
+matrices to the optimizer under test, embeddings / classifier head / norms /
+biases to AdamW at a fixed LR. The only quantity that varies is which optimizer
+updates the matrices. Each arm gets its own LR sweep and we compare
+**best-vs-best**: comparing at one shared LR measures tuning, not the optimizer.
+The sweep in this repo shows why — at 3e-3 you would "prove" Muon is vastly
+better, at 1e-5 the reverse.
+
+**Muon scaling.** Uses the Moonlight convention `0.2·√max(m,n)`, which matches
+the update's per-entry RMS to AdamW's (an orthogonalized `O` has
+`‖O‖_F ≈ √min(m,n)`, so entry RMS is `1/√max(m,n)`). This is what makes a shared
+LR grid meaningful. The original `√max(1, m/n)` convention would shift Muon's
+optimum roughly 8× lower.
+
+**Caveat not hidden.** The classification head is randomly initialized, so early
+steps are head-fitting rather than fine-tuning.
+
+## What is measured, and why
+
+**Geometry** — stable rank `‖ΔW‖²_F/‖ΔW‖²₂` and spectral entropy of the
+cumulative `ΔW = W_t − W₀`, plus per-layer relative update norm. These test the
+orthogonalization hypothesis directly.
+
+**Sharpness**, three ways, because they probe different things and can disagree:
+`λ_max(H)` by power iteration on Hessian-vector products (one stiff direction);
+`tr(H)` by Hutchinson (average curvature); and adaptive worst-case sharpness
+`max_{‖ε/|θ|‖≤ρ} L(θ+ε) − L(θ)` (a reachable ball, and reparameterization
+invariant). Plus a filter-normalized 1D loss profile.
+
+**Gradient noise** — `cos(g_t, g_{t−1})`, the mechanistic bridge to the momentum
+ablation: momentum buys variance reduction, and buys less when consecutive
+gradients are already aligned.
+
+**Cost** — wall-clock per step, so Muon's Newton–Schulz overhead is priced in
+rather than hidden by comparing step counts.
+
+## Implementation notes
+
+Three things that are easy to get silently wrong, all handled here:
+
+- **Newton–Schulz requires the Frobenius pre-normalization.** The quintic only
+  contracts for singular values ≤ 1; above that it diverges. `‖G‖₂ ≤ ‖G‖_F`
+  gives the guarantee for free.
+- **Under fp16 you must unscale before clipping.** Clipping a 65536×-scaled
+  gradient against a threshold of 1.0 silently clips everything to 1/65536 of
+  what you intended — no error, just worse results.
+- **Curvature probes need the SDPA math backend.** Flash and mem-efficient
+  attention have no double-backward implementation, so `create_graph=True` fails
+  with `derivative for aten::_scaled_dot_product_efficient_attention_backward is
+  not implemented`. Training keeps the fast kernels; only probes switch.
+
+Precision policy: fp16 autocast with fp32 master weights for training (T4 is
+Turing and has no bf16 tensor cores), fp32 for Newton–Schulz, and fp32 with
+autocast off for all curvature estimates — second derivatives under fp16 are
+noise.
+
+## Limitations
+
+One dataset, one task, SFT only — **this does not test the RLVR regime**, since
+SST-2 provides a dense signal rather than a sparse verified reward. Sharpness is
+measured on a single fixed 128-example batch and only at the final step, so the
+geometry evolution is visible through training but the landscape is not. One
+model size. 3 seeds for the main comparison, 4 for the momentum ablation; the
+sharpness and momentum effects are underpowered and are reported as such.
+
+
+## References
+
+Jordan et al. (2024), *Muon* (modded-nanogpt) · Liu et al. (2025), *Moonlight* ·
+Li et al. (2018), *Visualizing the Loss Landscape of Neural Nets* · Dinh et al.
+(2017), *Sharp Minima Can Generalize For Deep Nets* · Kwon et al. (2021), *ASAM*
